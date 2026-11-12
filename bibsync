@@ -23,12 +23,21 @@ config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/bibsync"
 links="$config_dir/links"
 zotero_db="${ZOTERO_DB:-$HOME/Zotero/zotero.sqlite}"
 port="${ZOTERO_PORT:-23119}"
-# where to look for Overleaf clones when linking; a project elsewhere can still
-# be linked by running "bibsync link" inside it
-search_roots=("$HOME/uni" "$HOME/src" "$HOME/Documents")
 
 mkdir -p "$config_dir"
 touch "$links"
+
+# where to look for Overleaf clones when linking, one folder per line in
+# ~/.config/bibsync/roots; without that file the whole home folder is searched,
+# which can take a few seconds. A project elsewhere can still be linked by
+# running "bibsync link" inside it.
+search_roots=()
+if [ -f "$config_dir/roots" ]; then
+    while read -r root; do
+        [ -n "$root" ] && search_roots+=("${root/#\~/$HOME}")
+    done < "$config_dir/roots"
+fi
+[ ${#search_roots[@]} -gt 0 ] || search_roots=("$HOME")
 
 # true when run from a terminal, false from dmenu_run or a keybind
 in_terminal() { [ -t 0 ] && [ -t 1 ]; }
@@ -39,8 +48,10 @@ notify() {
         printf '%s%s\n' "$title" "${body:+: $body}"
     elif command -v dunstify >/dev/null 2>&1; then
         dunstify -r 9903 -a bibsync -u "$urgency" "$title" "$body"
-    else
+    elif command -v notify-send >/dev/null 2>&1; then
         notify-send -a bibsync -u "$urgency" "$title" "$body"
+    else
+        printf '%s%s\n' "$title" "${body:+: $body}" >&2
     fi
 }
 
@@ -79,7 +90,8 @@ find_overleaf_repos() {
     local root dir
     for root in "${search_roots[@]}"; do
         [ -d "$root" ] || continue
-        find "$root" -maxdepth 4 \( -name node_modules -o -name .venv -o -name '.?*' -not -name .git \) -prune \
+        # -xdev keeps it off network mounts (rclone, sshfs), which can hang it
+        find "$root" -xdev -maxdepth 6 \( -name node_modules -o -name .venv -o -name '.?*' -not -name .git \) -prune \
             -o -type d -name .git -print 2>/dev/null
     done | while read -r dir; do
         dir=${dir%/.git}
