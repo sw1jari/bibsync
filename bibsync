@@ -110,6 +110,7 @@ link_project() {
     awk -F'\t' -v r="$repo" '$1 != r' "$links" > "$links.tmp"
     printf '%s\t%s\t%s\t%s\t%s\n' "$repo" "$bib" "$lib" "$key" "$path" >> "$links.tmp"
     mv "$links.tmp" "$links"
+    linked_repo=$repo
     notify low "bibsync" "Linked $(basename "$repo")/$bib to $path"
 }
 
@@ -167,7 +168,10 @@ case "${1:-}" in
         repo=$(current_repo)
         if [ -z "$repo" ]; then
             repo=$( { cut -f1 "$links"; echo "link a new project"; } | choose "Sync:") || exit 0
-            [ "$repo" = "link a new project" ] && { link_project; exit; }
+            if [ "$repo" = "link a new project" ]; then
+                link_project
+                repo=${linked_repo:-}
+            fi
         fi
         [ -n "$repo" ] || exit 0
         [ -n "$(link_for "$repo")" ] || link_project "$repo"
