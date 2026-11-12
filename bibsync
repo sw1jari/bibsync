@@ -103,9 +103,14 @@ link_project() {
         choose ".bib file in $(basename "$repo"):") || exit 0
     [ -n "$bib" ] || exit 0
 
-    collection=$(list_collections | choose "Zotero collection:") || exit 0
+    # menus get only the readable path (dmenu draws tabs as boxes); collections
+    # in group libraries get the library number added so names cannot clash
+    local label='{ print ($2 == 1 ? $1 : $1 "  (library " $2 ")") }'
+    collection=$(list_collections | awk -F'\t' "$label" | choose "Zotero collection:") || exit 0
     [ -n "$collection" ] || exit 0
-    IFS=$'\t' read -r path lib key <<< "$collection"
+    IFS=$'\t' read -r path lib key <<< "$(list_collections |
+        awk -F'\t' -v pick="$collection" "{ l = (\$2 == 1 ? \$1 : \$1 \"  (library \" \$2 \")\") } l == pick")"
+    [ -n "${key:-}" ] || die "Could not find the collection $collection"
 
     awk -F'\t' -v r="$repo" '$1 != r' "$links" > "$links.tmp"
     printf '%s\t%s\t%s\t%s\t%s\n' "$repo" "$bib" "$lib" "$key" "$path" >> "$links.tmp"
