@@ -1,0 +1,179 @@
+#!/bin/bash
+# Exports a Zotero collection to a .bib file in a local clone of an Overleaf
+# project, then commits and pushes it so Overleaf picks it up.
+#
+# The export comes from Better BibTeX's pull export on Zotero's local port, so
+# Zotero has to be running with Better BibTeX installed. Citation keys are the
+# ones Better BibTeX shows in Zotero.
+#
+# Each project is linked once to a collection and a .bib path; the links live in
+# ~/.config/bibsync/links. After that one run syncs everything.
+#
+#   bibsync           sync the project you are in, or pick one (dmenu or fzf)
+#   bibsync all       sync every linked project
+#   bibsync link      link a project to a collection (or change its link)
+#   bibsync list      show the links
+#
+# Works from dmenu_run too; choices then open in dmenu and results come back
+# as notifications.
+
+set -u
+
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/bibsync"
+links="$config_dir/links"
+zotero_db="${ZOTERO_DB:-$HOME/Zotero/zotero.sqlite}"
+port="${ZOTERO_PORT:-23119}"
+# where to look for Overleaf clones when linking; a project elsewhere can still
+# be linked by running "bibsync link" inside it
+search_roots=("$HOME/uni" "$HOME/src" "$HOME/Documents")
+
+mkdir -p "$config_dir"
+touch "$links"
+
+# true when run from a terminal, false from dmenu_run or a keybind
+in_terminal() { [ -t 0 ] && [ -t 1 ]; }
+
+notify() {
+    local urgency=$1 title=$2 body=${3:-}
+    if in_terminal; then
+        printf '%s%s\n' "$title" "${body:+: $body}"
+    elif command -v dunstify >/dev/null 2>&1; then
+        dunstify -r 9903 -a bibsync -u "$urgency" "$title" "$body"
+    else
+        notify-send -a bibsync -u "$urgency" "$title" "$body"
+    fi
+}
+
+die() { notify critical "bibsync" "$1"; exit 1; }
+
+# reads options on stdin, prints the chosen line
+choose() {
+    local prompt=$1
+    if in_terminal && command -v fzf >/dev/null 2>&1; then
+        fzf --prompt "$prompt " --height 40% --reverse
+    else
+        dmenu -i -l 15 -p "$prompt"
+    fi
+}
+
+is_overleaf_repo() {
+    git -C "$1" remote get-url origin 2>/dev/null | grep -q 'git\.overleaf\.com'
+}
+
+# collections as "full/path<TAB>libraryID<TAB>key", read from a snapshot of
+# the database because Zotero keeps it locked while it runs
+list_collections() {
+    [ -f "$zotero_db" ] || die "No Zotero database at $zotero_db"
+    sqlite3 -separator $'\t' "file:$zotero_db?immutable=1" "
+        with recursive tree(id, path, lib, key) as (
+            select collectionID, collectionName, libraryID, key
+            from collections where parentCollectionID is null
+            union all
+            select c.collectionID, t.path || '/' || c.collectionName, c.libraryID, c.key
+            from collections c join tree t on c.parentCollectionID = t.id
+        )
+        select path, lib, key from tree order by lib, path;"
+}
+
+find_overleaf_repos() {
+    local root dir
+    for root in "${search_roots[@]}"; do
+        [ -d "$root" ] || continue
+        find "$root" -maxdepth 4 \( -name node_modules -o -name .venv -o -name '.?*' -not -name .git \) -prune \
+            -o -type d -name .git -print 2>/dev/null
+    done | while read -r dir; do
+        dir=${dir%/.git}
+        is_overleaf_repo "$dir" && echo "$dir"
+    done | sort -u
+}
+
+# the link line for a repo, if any: repo<TAB>bib<TAB>lib<TAB>key<TAB>path
+link_for() { awk -F'\t' -v r="$1" '$1 == r' "$links"; }
+
+link_project() {
+    local repo=${1:-} bib bibs collection lib key path
+    if [ -z "$repo" ]; then
+        repo=$(find_overleaf_repos | choose "Overleaf project:") || exit 0
+    fi
+    [ -n "$repo" ] || exit 0
+
+    # offer the .bib files already in the project, plus a new one
+    bibs=$(cd "$repo" && git ls-files '*.bib')
+    bib=$(printf '%s\nreferences.bib\n' "$bibs" | grep -v '^$' | awk '!seen[$0]++' |
+        choose ".bib file in $(basename "$repo"):") || exit 0
+    [ -n "$bib" ] || exit 0
+
+    collection=$(list_collections | choose "Zotero collection:") || exit 0
+    [ -n "$collection" ] || exit 0
+    IFS=$'\t' read -r path lib key <<< "$collection"
+
+    awk -F'\t' -v r="$repo" '$1 != r' "$links" > "$links.tmp"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$repo" "$bib" "$lib" "$key" "$path" >> "$links.tmp"
+    mv "$links.tmp" "$links"
+    notify low "bibsync" "Linked $(basename "$repo")/$bib to $path"
+}
+
+sync_project() {
+    local repo=$1 bib lib key path tmp count
+    IFS=$'\t' read -r _ bib lib key path <<< "$(link_for "$repo")"
+    [ -n "${key:-}" ] || die "$(basename "$repo") is not linked yet, run: bibsync link"
+
+    curl -s -o /dev/null "http://127.0.0.1:$port/connector/ping" ||
+        die "Zotero is not running"
+
+    tmp=$(mktemp)
+    trap 'rm -f "$tmp"' RETURN
+    if ! curl -sf -o "$tmp" "http://127.0.0.1:$port/better-bibtex/export/collection?/$lib/$key.bibtex"; then
+        die "Better BibTeX export failed for $path (is the plugin installed and the collection still there?)"
+    fi
+
+    cd "$repo" || die "Cannot open $repo"
+    git pull -q --rebase --autostash || die "git pull failed in $(basename "$repo"), sort it out by hand"
+
+    mkdir -p "$(dirname "$bib")"
+    if [ -f "$bib" ] && cmp -s "$tmp" "$bib"; then
+        notify low "bibsync" "$(basename "$repo"): already up to date"
+        return
+    fi
+    cp "$tmp" "$bib"
+    count=$(grep -c '^@' "$bib")
+
+    git add -- "$bib"
+    git commit -q -m "Update references" -- "$bib" || die "Commit failed in $(basename "$repo")"
+    if git push -q 2>/dev/null; then
+        notify normal "bibsync" "$(basename "$repo"): pushed $count references from $path"
+    else
+        die "$(basename "$repo"): committed but push failed, run git push there"
+    fi
+}
+
+current_repo() {
+    local top
+    top=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+    is_overleaf_repo "$top" && echo "$top"
+}
+
+case "${1:-}" in
+    link)
+        link_project "$(current_repo)"
+        ;;
+    list)
+        awk -F'\t' '{ printf "%s/%s  <-  %s\n", $1, $2, $5 }' "$links"
+        ;;
+    all)
+        cut -f1 "$links" | while read -r repo; do sync_project "$repo"; done
+        ;;
+    "")
+        repo=$(current_repo)
+        if [ -z "$repo" ]; then
+            repo=$( { cut -f1 "$links"; echo "link a new project"; } | choose "Sync:") || exit 0
+            [ "$repo" = "link a new project" ] && { link_project; exit; }
+        fi
+        [ -n "$repo" ] || exit 0
+        [ -n "$(link_for "$repo")" ] || link_project "$repo"
+        sync_project "$repo"
+        ;;
+    *)
+        sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+esac
